@@ -1,23 +1,71 @@
-# Dependencies
+# =======================
+# Dependencies (وابستگی‌ها)
+# =======================
 node_modules/
+.pnp
+.pnp.js
 
-# Environment variables
+# =======================
+# Environment Variables (متغیرهای محیطی - بسیار مهم برای امنیت)
+# =======================
 .env
 .env.local
-.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+# نکته: اگر فایل نمونه دارید که تیم باید از آن استفاده کند، خط زیر را از کامنت خارج کنید:
+# !.env.example
 
-# Build output
+# =======================
+# Build Output (خروجی بیلد)
+# =======================
 dist/
 build/
+.next/
+out/
+.nuxt/
 
-# Logs
-*.log
+# =======================
+# Logs (لاگ‌ها)
+# =======================
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
 
-# OS files
+# =======================
+# OS & System Files (فایل‌های سیستم عامل)
+# =======================
 .DS_Store
 Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
-# IDE
-.vscode/
+# =======================
+# IDE & Editor Configs (تنظیمات ادیتورها)
+# =======================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
 .idea/
+*.swp
+*.swo
+*~
+
+# =======================
+# Testing Coverage (پوشش تست)
+# =======================
+coverage/
+.nyc_output/
+
+# =======================
+# Misc (متفرقه)
+# =======================
+*.pem
+*.key
+cache/
+temp/
+tmp/
