@@ -1,0 +1,33 @@
+﻿import dotenv from "dotenv";
+import { pool } from "../db.js";
+
+dotenv.config();
+
+async function main() {
+  try {
+    const result = await pool.query(`
+      CREATE TABLE IF NOT EXISTS patient_login_otps (
+        id BIGSERIAL PRIMARY KEY,
+        phone VARCHAR(20) NOT NULL,
+        national_code VARCHAR(10) NOT NULL,
+        full_name VARCHAR(150),
+        otp_hash VARCHAR(128) NOT NULL,
+        attempts SMALLINT NOT NULL DEFAULT 0
+          CHECK (attempts >= 0 AND attempts <= 5),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        request_ip INET
+      );
+    `);
+
+    console.log("OTP table creation command completed.");
+  } catch (error) {
+    console.error("OTP table creation failed:", error.message);
+    process.exitCode = 1;
+  } finally {
+    await pool.end();
+  }
+}
+
+main();

@@ -1,0 +1,443 @@
+import { query } from "../db.js";
+import { effectiveBranchId } from "../middleware/auth.js";
+import { createNotification } from "../utils/notifications.js";
+/**
+ * فهرست نوبت‌ها — برای صف امروز و نمای تقویم پزشک استفاده می‌شود
+ * پارامترها: branch_id (اختیاری اگر کاربر خودش محدود به یک شعبه باشد)، doctor_id، date (YYYY-MM-DD میلادی)
+ */
+export async function listAppointments(req, res) {
+  const clinicId = req.user?.clinic_id;
+  if (!clinicId) return res.status(403).json({ error: "حساب کاربری به کلینیک متصل نیست" });
+
+  const { date } = req.query;
+  let branchId = effectiveBranchId(req);
+  if (req.user.role === "super_admin") branchId = req.query.branch_id || null;
+  else if (req.query.branch_id && branchId && String(req.query.branch_id) !== String(branchId)) {
+    return res.status(403).json({ error: "به این شعبه دسترسی ندارید" });
+  } else if (!branchId && req.query.branch_id) {
+    branchId = req.query.branch_id;
+  }
+
+  if (branchId) {
+    const branchResult = await query(
+      `SELECT id FROM branches WHERE id = $1 AND clinic_id = $2`,
+      [branchId, clinicId]
+    );
+    if (!branchResult.rows[0]) return res.status(403).json({ error: "شعبه در این کلینیک مجاز نیست" });
+  }
+
+  let doctorId;
+  if (req.user.role === "doctor") {
+    const ownDoctor = await query(
+      `SELECT d.id FROM doctors d JOIN users u ON u.id = d.user_id
+       WHERE d.user_id = $1 AND u.clinic_id = $2 AND u.is_active = TRUE LIMIT 1`,
+      [req.user.id, clinicId]
+    );
+    doctorId = ownDoctor.rows[0]?.id;
+    if (!doctorId) return res.status(403).json({ error: "پروفایل پزشک یافت نشد" });
+  } else if (req.query.doctor_id) {
+    const doctorResult = await query(
+      `SELECT d.id FROM doctors d JOIN users u ON u.id = d.user_id
+       WHERE d.id = $1 AND u.clinic_id = $2`,
+      [req.query.doctor_id, clinicId]
+    );
+    if (!doctorResult.rows[0]) return res.status(403).json({ error: "به این پزشک دسترسی ندارید" });
+    doctorId = doctorResult.rows[0].id;
+  }
+
+  const conditions = ["b.clinic_id = $1", "p.clinic_id = $1", "du.clinic_id = $1"];
+  const params = [clinicId];
+  if (branchId) {
+    params.push(branchId);
+    conditions.push(`a.branch_id = $${params.length}`);
+  }
+  if (doctorId) {
+    params.push(doctorId);
+    conditions.push(`a.doctor_id = $${params.length}`);
+  }
+  if (date) {
+    params.push(date);
+    conditions.push(`a.appointment_at::date = $${params.length}`);
+  }
+
+  const { rows } = await query(
+    `SELECT a.id, a.appointment_at, a.status, a.notes,
+            p.id AS patient_id, p.full_name AS patient_name, p.phone AS patient_phone,
+            d.id AS doctor_id, u.full_name AS doctor_name
+     FROM appointments a
+     JOIN branches b ON b.id = a.branch_id
+     JOIN patients p ON p.id = a.patient_id
+     JOIN doctors d ON d.id = a.doctor_id
+     JOIN users du ON du.id = d.user_id
+     JOIN users u ON u.id = d.user_id
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY a.appointment_at`,
+    params
+  );
+
+  res.json({ appointments: rows });
+}
+
+export async function createAppointment(req, res) {
+  const { patient_id, doctor_id, branch_id, appointment_at, notes } = req.body;
+  const clinicId = req.user?.clinic_id;
+  const allowedRoles = ["super_admin", "branch_admin", "secretary", "doctor"];
+
+  if (!allowedRoles.includes(req.user.role)) {
+    return res.status(403).json({ error: "اجازه ثبت نوبت ندارید" });
+  }
+  if (!clinicId) return res.status(403).json({ error: "حساب کاربری به کلینیک متصل نیست" });
+  if (!patient_id || !doctor_id || !branch_id || !appointment_at) {
+    return res.status(400).json({ error: "بیمار، پزشک، شعبه و زمان نوبت الزامی است" });
+  }
+
+  const branchResult = await query(
+    `SELECT id FROM branches WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE`,
+    [branch_id, clinicId]
+  );
+  if (!branchResult.rows[0]) return res.status(403).json({ error: "شعبه انتخاب‌شده در این کلینیک مجاز نیست" });
+
+  if (req.user.role !== "super_admin" && req.user.role !== "doctor" && req.user.branch_id &&
+      String(req.user.branch_id) !== String(branch_id)) {
+    return res.status(403).json({ error: "به این شعبه دسترسی ندارید" });
+  }
+
+  const patientResult = await query(
+    `SELECT id FROM patients WHERE id = $1 AND clinic_id = $2`,
+    [patient_id, clinicId]
+  );
+  if (!patientResult.rows[0]) return res.status(404).json({ error: "بیمار در این کلینیک یافت نشد" });
+
+  let actualDoctorId = doctor_id;
+  if (req.user.role === "doctor") {
+    const ownDoctor = await query(
+      `SELECT d.id FROM doctors d JOIN users u ON u.id = d.user_id
+       WHERE d.user_id = $1 AND u.clinic_id = $2 AND u.is_active = TRUE LIMIT 1`,
+      [req.user.id, clinicId]
+    );
+    actualDoctorId = ownDoctor.rows[0]?.id;
+    if (!actualDoctorId || String(actualDoctorId) !== String(doctor_id)) {
+      return res.status(403).json({ error: "پزشک نوبت باید حساب خودتان باشد" });
+    }
+  }
+
+  const doctorResult = await query(
+    `SELECT d.id
+     FROM doctors d
+     JOIN users u ON u.id = d.user_id
+     JOIN doctor_branches db ON db.doctor_id = d.id AND db.branch_id = $2
+     WHERE d.id = $1 AND u.clinic_id = $3 AND u.is_active = TRUE`,
+    [actualDoctorId, branch_id, clinicId]
+  );
+  if (!doctorResult.rows[0]) return res.status(403).json({ error: "پزشک به این کلینیک یا شعبه متصل نیست" });
+
+  const conflict = await query(
+    `SELECT id FROM appointments
+     WHERE doctor_id = $1 AND appointment_at = $2 AND status NOT IN ('cancelled', 'no_show')`,
+    [actualDoctorId, appointment_at]
+  );
+  if (conflict.rows.length > 0) {
+    return res.status(409).json({ error: "این زمان قبلاً برای این پزشک رزرو شده است" });
+  }
+
+    try {
+      const { rows } = await query(
+        `INSERT INTO appointments (patient_id, doctor_id, branch_id, appointment_at, notes, booked_by)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *`,
+        [patient_id, actualDoctorId, branch_id, appointment_at, notes || null, req.user.id]
+      );
+
+      // ساخت اعلان برای پزشک (اگه خود پزشک نوبت رو ثبت نکرده باشه)
+      if (req.user.role !== "doctor") {
+        const patientInfo = await query(
+          `SELECT full_name FROM patients WHERE id = $1`,
+          [patient_id]
+        );
+        const doctorUserInfo = await query(
+          `SELECT u.id AS user_id, u.full_name AS doctor_name
+           FROM doctors d
+           JOIN users u ON u.id = d.user_id
+           WHERE d.id = $1`,
+          [actualDoctorId]
+        );
+        const branchInfo = await query(
+          `SELECT name FROM branches WHERE id = $1`,
+          [branch_id]
+        );
+
+        const doctorUser = doctorUserInfo.rows[0];
+        if (doctorUser?.user_id) {
+          const appointmentDate = new Date(appointment_at).toLocaleString("fa-IR", {
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+
+          await createNotification({
+            userId: doctorUser.user_id,
+            clinicId,
+            type: "appointment_created",
+            title: "نوبت جدید ثبت شد",
+            message: `${patientInfo.rows[0]?.full_name || "بیمار"} برای شما در ${branchInfo.rows[0]?.name || ""} در تاریخ ${appointmentDate} نوبت گرفت.`,
+            link: "/doctor/calendar",
+            metadata: {
+              appointment_id: rows[0].id,
+              patient_id: patient_id,
+              branch_id: branch_id,
+            },
+          });
+        }
+      }
+
+      res.status(201).json({ appointment: rows[0] });
+    } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "این زمان قبلاً برای این پزشک رزرو شده است" });
+    }
+    throw err;
+  }
+}
+
+const VALID_STATUSES = ["booked", "checked_in", "in_visit", "completed", "cancelled", "no_show"];
+
+export async function updateAppointmentStatus(req, res) {
+  const { id } = req.params;
+  const { status } = req.body;
+  const clinicId = req.user?.clinic_id;
+  const allowedRoles = ["super_admin", "branch_admin", "secretary", "doctor"];
+
+  if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: "اجازه تغییر وضعیت نوبت ندارید" });
+  if (!clinicId) return res.status(403).json({ error: "حساب کاربری به کلینیک متصل نیست" });
+  if (!VALID_STATUSES.includes(status)) {
+    return res.status(400).json({ error: "وضعیت نوبت نامعتبر است" });
+  }
+
+  const { rows: foundRows } = await query(
+    `SELECT a.id, a.branch_id, a.doctor_id, b.clinic_id, du.id AS doctor_user_id
+     FROM appointments a
+     JOIN branches b ON b.id = a.branch_id
+     JOIN doctors d ON d.id = a.doctor_id
+     JOIN users du ON du.id = d.user_id
+     JOIN patients p ON p.id = a.patient_id
+     WHERE a.id = $1 AND b.clinic_id = $2 AND du.clinic_id = $2 AND p.clinic_id = $2`,
+    [id, clinicId]
+  );
+  const appointment = foundRows[0];
+  if (!appointment) return res.status(404).json({ error: "نوبت در این کلینیک یافت نشد" });
+
+  if (req.user.role === "doctor" && String(appointment.doctor_user_id) !== String(req.user.id)) {
+    return res.status(403).json({ error: "فقط می‌توانید وضعیت نوبت‌های خودتان را تغییر دهید" });
+  }
+  if (req.user.role !== "super_admin" && req.user.role !== "doctor" && req.user.branch_id &&
+      String(req.user.branch_id) !== String(appointment.branch_id)) {
+    return res.status(403).json({ error: "به این شعبه دسترسی ندارید" });
+  }
+
+  const { rows } = await query(
+    `UPDATE appointments SET status = $1 WHERE id = $2 AND branch_id = $3 RETURNING *`,
+    [status, id, appointment.branch_id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: "نوبت یافت نشد" });
+  res.json({ appointment: rows[0] });
+}
+/* ============================================================ */
+/* لیست درخواست‌های نوبت (pending) — برای منشی/مدیر              */
+/* ============================================================ */
+export async function listPendingAppointments(req, res) {
+  const clinicId = req.user?.clinic_id;
+  if (!clinicId) {
+    return res.status(403).json({ error: "حساب کاربری به کلینیک متصل نیست" });
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT 
+         a.id,
+         a.appointment_at,
+         a.status,
+         a.notes,
+         a.created_at,
+         a.booked_by_patient,
+         p.id AS patient_id,
+         p.full_name AS patient_name,
+         p.phone AS patient_phone,
+         p.national_code AS patient_national_code,
+         d.id AS doctor_id,
+         u.full_name AS doctor_name,
+         s.name AS doctor_specialty,
+         b.id AS branch_id,
+         b.name AS branch_name,
+         c.id AS clinic_id,
+         c.name AS clinic_name
+       FROM appointments a
+       JOIN patients p ON p.id = a.patient_id
+       JOIN doctors d ON d.id = a.doctor_id
+       JOIN users u ON u.id = d.user_id
+       LEFT JOIN specialties s ON s.id = d.specialty_id
+       JOIN branches b ON b.id = a.branch_id
+       JOIN clinics c ON c.id = b.clinic_id
+       WHERE c.id = $1
+         AND a.status = 'pending'
+         AND a.booked_by_patient IS NOT NULL
+       ORDER BY a.created_at DESC`,
+      [clinicId]
+    );
+
+    res.json({ pending: rows });
+  } catch (err) {
+    console.error("listPendingAppointments error:", err);
+    res.status(500).json({ error: "خطا در دریافت درخواست‌ها" });
+  }
+}
+
+/* ============================================================ */
+/* تأیید یا رد درخواست نوبت — برای منشی/مدیر                     */
+/* ============================================================ */
+export async function reviewAppointment(req, res) {
+  const clinicId = req.user?.clinic_id;
+  const { id } = req.params;
+  const { action } = req.body; // "approve" | "reject"
+
+  if (!clinicId) {
+    return res.status(403).json({ error: "حساب کاربری به کلینیک متصل نیست" });
+  }
+
+  if (!["approve", "reject"].includes(action)) {
+    return res.status(400).json({ error: "عملیات نامعتبر است" });
+  }
+
+  try {
+    // بررسی وجود نوبت در همین کلینیک
+    const check = await query(
+  `SELECT 
+     a.id, a.status, a.doctor_id, a.appointment_at,
+     a.patient_id, a.booked_by_patient,
+     p.full_name AS patient_name,
+     u.full_name AS doctor_name,
+     b.name AS branch_name
+   FROM appointments a
+   JOIN branches b ON b.id = a.branch_id
+   JOIN patients p ON p.id = a.patient_id
+   JOIN doctors d ON d.id = a.doctor_id
+   JOIN users u ON u.id = d.user_id
+   WHERE a.id = $1 AND b.clinic_id = $2`,
+  [id, clinicId]
+);
+
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: "درخواست یافت نشد" });
+    }
+
+    const appointment = check.rows[0];
+
+    if (appointment.status !== "pending") {
+      return res.status(409).json({
+        error: "این درخواست قبلاً بررسی شده است",
+        code: "ALREADY_REVIEWED",
+      });
+    }
+
+    if (action === "approve") {
+      // بررسی اینکه اسلات هنوز خالی است
+      const conflict = await query(
+        `SELECT id FROM appointments
+         WHERE doctor_id = $1 AND appointment_at = $2
+           AND status IN ('booked', 'checked_in', 'in_visit')
+           AND id <> $3`,
+        [appointment.doctor_id, appointment.appointment_at, id]
+      );
+
+      if (conflict.rows.length > 0) {
+        return res.status(409).json({
+          error: "این زمان قبلاً توسط نوبت دیگری گرفته شده است",
+          code: "SLOT_TAKEN",
+        });
+      }
+
+      // تأیید: status → booked
+             // تأیید: status → booked
+        const { rows } = await query(
+          `UPDATE appointments
+           SET status = 'booked'
+           WHERE id = $1
+           RETURNING id, status, appointment_at`,
+          [id]
+        );
+
+        // ساخت اعلان برای بیمار (اگه درخواست از پنل بیمار بوده)
+        if (appointment.booked_by_patient) {
+          const appointmentDate = new Date(appointment.appointment_at).toLocaleString("fa-IR", {
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+
+          await createNotification({
+            patientAccountId: appointment.booked_by_patient,
+            clinicId,
+            type: "appointment_confirmed",
+            title: "نوبت شما تأیید شد",
+            message: `نوبت شما با دکتر ${appointment.doctor_name} در ${appointment.branch_name} برای ${appointmentDate} تأیید شد.`,
+            link: "/patient/appointments",
+            metadata: {
+              appointment_id: id,
+              doctor_id: appointment.doctor_id,
+            },
+          });
+        }
+
+        return res.json({
+          appointment: rows[0],
+          message: "درخواست نوبت تأیید شد",
+        });
+    }
+
+    // رد: status → rejected
+         // رد: status → rejected
+      const { rows } = await query(
+        `UPDATE appointments
+         SET status = 'rejected'
+         WHERE id = $1
+         RETURNING id, status, appointment_at`,
+        [id]
+      );
+
+      // ساخت اعلان برای بیمار (اگه درخواست از پنل بیمار بوده)
+      if (appointment.booked_by_patient) {
+        const appointmentDate = new Date(appointment.appointment_at).toLocaleString("fa-IR", {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+        await createNotification({
+          patientAccountId: appointment.booked_by_patient,
+          clinicId,
+          type: "appointment_rejected",
+          title: "درخواست نوبت شما رد شد",
+          message: `متأسفانه درخواست نوبت شما با دکتر ${appointment.doctor_name} در ${appointment.branch_name} برای ${appointmentDate} رد شد.`,
+          link: "/patient/new-appointment",
+          metadata: {
+            appointment_id: id,
+            doctor_id: appointment.doctor_id,
+          },
+        });
+      }
+
+      res.json({
+        appointment: rows[0],
+        message: "درخواست نوبت رد شد",
+      });
+  } catch (err) {
+    console.error("reviewAppointment error:", err);
+    res.status(500).json({ error: "خطا در بررسی درخواست" });
+  }
+}
+
